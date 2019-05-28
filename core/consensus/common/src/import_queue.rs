@@ -106,8 +106,6 @@ pub trait ImportQueue<B: BlockT>: Send + Sync + ImportQueueClone<B> {
 	fn start(&self, _link: Box<Link<B>>) -> Result<(), std::io::Error> {
 		Ok(())
 	}
-	/// Clears the import queue and stops importing.
-	fn stop(&self);
 	/// Import bunch of blocks.
 	fn import_blocks(&self, origin: BlockOrigin, blocks: Vec<IncomingBlock<B>>);
 	/// Import a block justification.
@@ -175,10 +173,6 @@ impl<B: BlockT, V: 'static + Verifier<B>> ImportQueue<B> for BasicSyncQueue<B, V
 		Ok(())
 	}
 
-	fn stop(&self) {
-		// nothing to do here
-	}
-
 	fn import_blocks(&self, origin: BlockOrigin, blocks: Vec<IncomingBlock<B>>) {
 		if blocks.is_empty() {
 			return;
@@ -244,6 +238,14 @@ impl<B: BlockT> ImportQueueClone<B> for BasicQueue<B> {
 	}
 }
 
+impl<B: BlockT> Drop for BasicQueue<B> {
+	fn drop(&mut self) {
+		let (sender, receiver) = channel::unbounded();
+		if self.sender.send(BlockImportMsg::Shutdown(sender)).is_ok() {
+			let _ = receiver.recv();
+		}
+	}
+}
 
 /// "BasicQueue" is a wrapper around a channel sender to the "BlockImporter".
 /// "BasicQueue" itself does not keep any state or do any importing work, and
@@ -317,13 +319,6 @@ impl<B: BlockT> ImportQueue<B> for BasicQueue<B> {
 		port.recv().expect("1. self is holding a sender to the Importer, 2. Importer should handle messages while there are senders around; qed")
 	}
 
-	fn stop(&self) {
-		let _ = self
-			.sender
-			.send(BlockImportMsg::Stop)
-			.expect("1. self is holding a sender to the Importer, 2. Importer should handle messages while there are senders around; qed");
-	}
-
 	fn import_blocks(&self, origin: BlockOrigin, blocks: Vec<IncomingBlock<B>>) {
 		if blocks.is_empty() {
 			return;
@@ -354,12 +349,12 @@ pub enum BlockImportMsg<B: BlockT> {
 	ImportJustification(Origin, B::Hash, NumberFor<B>, Justification),
 	ImportFinalityProof(Origin, B::Hash, NumberFor<B>, Vec<u8>),
 	Start(Box<Link<B>>, Sender<Result<(), std::io::Error>>),
-	Stop,
+	Shutdown(Sender<()>),
 	#[cfg(any(test, feature = "test-helpers"))]
 	Synchronize,
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(Debug))]
 pub enum BlockImportWorkerMsg<B: BlockT> {
 	ImportBlocks(BlockOrigin, Vec<IncomingBlock<B>>),
 	ImportedBlocks(
@@ -370,6 +365,7 @@ pub enum BlockImportWorkerMsg<B: BlockT> {
 	),
 	ImportFinalityProof(Origin, B::Hash, NumberFor<B>, Vec<u8>),
 	ImportedFinalityProof(Origin, (B::Hash, NumberFor<B>), Result<(B::Hash, NumberFor<B>), ()>),
+	Shutdown(Sender<()>),
 	#[cfg(any(test, feature = "test-helpers"))]
 	Synchronize,
 }
@@ -476,7 +472,16 @@ impl<B: BlockT> BlockImporter<B> {
 				self.link = Some(link);
 				let _ = sender.send(Ok(()));
 			},
-			BlockImportMsg::Stop => return false,
+			BlockImportMsg::Shutdown(result_sender) => {
+				// stop worker thread
+				let (sender, receiver) = channel::unbounded();
+				if self.worker_sender.send(BlockImportWorkerMsg::Shutdown(sender)).is_ok() {
+					let _ = receiver.recv();
+				}
+				// send shutdown notification
+				let _ = result_sender.send(());
+				return false;
+			},
 			#[cfg(any(test, feature = "test-helpers"))]
 			BlockImportMsg::Synchronize => {
 				trace!(target: "sync", "Received synchronization message");
@@ -511,7 +516,8 @@ impl<B: BlockT> BlockImporter<B> {
 			},
 			BlockImportWorkerMsg::ImportBlocks(_, _)
 				| BlockImportWorkerMsg::ImportFinalityProof(_, _, _, _)
-					=> unreachable!("Import Worker does not send Import* message; qed"),
+				| BlockImportWorkerMsg::Shutdown(_)
+					=> unreachable!("Import Worker does not send Import*/Shutdown messages; qed"),
 		};
 
 		process_import_results(&**link, results);
@@ -565,6 +571,10 @@ impl<B: BlockT, V: 'static + Verifier<B>> BlockImportWorker<B, V> {
 						},
 						BlockImportWorkerMsg::ImportFinalityProof(who, hash, number, proof) => {
 							worker.import_finality_proof(who, hash, number, proof);
+						},
+						BlockImportWorkerMsg::Shutdown(result_sender) => {
+							let _ = result_sender.send(());
+							break;
 						},
 						#[cfg(any(test, feature = "test-helpers"))]
 						BlockImportWorkerMsg::Synchronize => {
@@ -1090,12 +1100,19 @@ mod tests {
 		)).unwrap();
 
 		// Wait until this request is redirected to the BlockImportWorker
-		assert_eq!(worker_receiver.recv(), Ok(BlockImportWorkerMsg::ImportFinalityProof(
-			who.clone(),
-			Default::default(),
-			1,
-			vec![42],
-		)));
+		match worker_receiver.recv().unwrap() {
+			BlockImportWorkerMsg::ImportFinalityProof(
+				cwho,
+				chash,
+				1,
+				cproof,
+			) => {
+				assert_eq!(cwho, who);
+				assert_eq!(chash, Default::default());
+				assert_eq!(cproof, vec![42]);
+			},
+			_ => unreachable!("Unexpected work request received"),
+		}
 
 		// Send ack of proof import from BlockImportWorker to BlockImporter
 		result_sender.send(BlockImportWorkerMsg::ImportedFinalityProof(
