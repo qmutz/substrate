@@ -1005,7 +1005,7 @@ mod tests {
 
 		{
 			let changes_trie_storage = InMemoryChangesTrieStorage::new();
-			let mut ext = Ext::new(&mut overlay, &backend, Some(&changes_trie_storage), NeverOffchainExt::new());
+			let mut ext = Ext::new(&mut overlay, backend, Some(&changes_trie_storage), NeverOffchainExt::new());
 			ext.clear_prefix(b"ab");
 		}
 		overlay.commit_prospective();
