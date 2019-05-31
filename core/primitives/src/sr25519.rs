@@ -47,6 +47,7 @@ const SIGNING_CTX: &[u8] = b"substrate";
 
 /// An Schnorrkel/Ristretto x25519 ("sr25519") public key.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Encode, Decode, Default)]
+#[cfg_attr(not(feature = "std"), derive(Debug, Hash))]
 pub struct Public(pub [u8; 32]);
 
 /// An Schnorrkel/Ristretto x25519 ("sr25519") key pair.
@@ -134,13 +135,6 @@ impl<'de> Deserialize<'de> for Public {
 #[cfg(feature = "std")]
 impl ::std::hash::Hash for Public {
 	fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
-		self.0.hash(state);
-	}
-}
-
-#[cfg(not(feature = "std"))]
-impl ::core::hash::Hash for Public {
-	fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
 		self.0.hash(state);
 	}
 }
